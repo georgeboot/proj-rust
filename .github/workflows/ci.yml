@@ -39,6 +39,12 @@ jobs:
       - name: Test serde feature
         run: cargo test -p proj-core --features serde --locked
 
+      - name: Clippy geotiff feature
+        run: cargo clippy -p proj-core --features geotiff --all-targets --locked -- -D warnings
+
+      - name: Test geotiff feature
+        run: cargo test -p proj-core --features geotiff --locked
+
   gen-reference:
     name: Registry Generator
     runs-on: ubuntu-24.04
