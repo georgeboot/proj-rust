@@ -1,7 +1,7 @@
 use crate::coord::{
     Bounds, Coord, Coord3D, Transformable, Transformable3D, MAX_BOUNDS_DENSIFY_POINTS,
 };
-use crate::crs::CrsDef;
+use crate::crs::{CrsDef, LinearUnit};
 use crate::error::{Error, Result};
 use crate::grid::{GridError, GridRuntime};
 use crate::operation::{
@@ -38,12 +38,9 @@ use pipeline::PARALLEL_MIN_ITEMS_PER_THREAD;
 #[cfg(test)]
 use pipeline::{PipelineSourceXyUnits, PipelineTargetXyUnits};
 
-/// Geoid-grid vertical transforms compose with the pre-datum-shift
-/// ellipsoidal height: applying one across a Helmert/geocentric horizontal
-/// pipeline would silently drop the datum shift's ellipsoidal-height change.
-/// Every supported geoid path rides an identity or grid-based horizontal
-/// operation today, so reject the unsupported composition at construction
-/// instead of producing wrong heights.
+/// Geoid grids compose with the pre-datum ellipsoidal height. Reject them on
+/// pipelines that change that height. Horizontal-only Helmert can compose
+/// because push/pop restores it.
 fn validate_vertical_composition(
     vertical: &VerticalTransform,
     pipeline: &CompiledOperationPipeline,
@@ -63,6 +60,12 @@ fn validate_vertical_composition(
         ));
     }
     Ok(())
+}
+
+/// Vertical unit of `crs` when it differs from metres.
+fn non_metre_height_unit(crs: &CrsDef) -> Option<LinearUnit> {
+    let unit = crs.vertical_crs()?.linear_unit();
+    ((unit.meters_per_unit() - 1.0).abs() > 1e-12).then_some(unit)
 }
 
 /// A reusable coordinate transformation between two CRS.
@@ -278,7 +281,9 @@ impl Transform {
         })
     }
 
-    /// Transform a single coordinate.
+    /// Transform a single 2D coordinate.
+    ///
+    /// XY-only. Geocentric endpoints must use [`Self::convert_3d`].
     pub fn convert<T: Transformable>(&self, coord: T) -> Result<T> {
         let c = coord.to_coord();
         let result = self.convert_coord(c)?;
@@ -327,10 +332,10 @@ impl Transform {
         Ok(T::from_coord3d(result))
     }
 
-    /// Transform a single coordinate and report the operation actually used.
+    /// Transform a single 2D coordinate and report the operation actually used.
     ///
-    /// This 2D API is XY-only: it does not apply or sample configured vertical
-    /// transforms.
+    /// XY-only: it does not apply configured vertical transforms. Geocentric
+    /// endpoints must use [`Self::convert_3d_with_diagnostics`].
     ///
     /// When the selected grid-backed operation misses grid coverage, this
     /// reports the coverage misses and the lower-ranked fallback operation that
@@ -724,15 +729,36 @@ impl Transform {
         )))
     }
 
-    /// Without a vertical CRS on either side, `convert_3d` heights are
-    /// ellipsoidal, so datum-shift-induced height changes computed by the
-    /// horizontal pipeline must survive — the same semantics C PROJ applies
-    /// to the 3D promotions of the CRS pair. With vertical CRSs present, the
-    /// vertical transform owns `z` (gravity-related heights are unaffected
-    /// by ellipsoidal datum math).
+    /// True when this pipeline changes ellipsoidal height and no vertical CRS
+    /// owns `z`.
     fn pipeline_owns_height(&self, pipeline: &CompiledOperationPipeline) -> bool {
         pipeline.transforms_ellipsoidal_height
             && matches!(self.vertical_transform, VerticalTransform::None { .. })
+    }
+
+    /// Run a pipeline that owns `z`. Height is metres except at a mixed
+    /// geodetic to ECEF boundary with a non-metre vertical unit.
+    fn execute_pipeline_owned(
+        &self,
+        pipeline: &CompiledOperationPipeline,
+        mut coord: Coord3D,
+    ) -> Result<Coord3D> {
+        match (self.source.is_geocentric(), self.target.is_geocentric()) {
+            (false, true) => {
+                if let Some(unit) = non_metre_height_unit(&self.source) {
+                    coord.z = unit.to_meters(coord.z);
+                }
+                execute_pipeline_xyz(pipeline, coord)
+            }
+            (true, false) => {
+                coord = execute_pipeline_xyz(pipeline, coord)?;
+                if let Some(unit) = non_metre_height_unit(&self.target) {
+                    coord.z = unit.from_meters(coord.z);
+                }
+                Ok(coord)
+            }
+            _ => execute_pipeline_xyz(pipeline, coord),
+        }
     }
 
     fn execute_pipeline(
@@ -742,7 +768,7 @@ impl Transform {
     ) -> Result<PipelineExecutionOutcome> {
         validate_vertical_ordinate(c.z)?;
         if self.pipeline_owns_height(pipeline) {
-            let coord = execute_pipeline_xyz(pipeline, c)?;
+            let coord = self.execute_pipeline_owned(pipeline, c)?;
             return Ok(PipelineExecutionOutcome {
                 coord,
                 vertical: self.vertical_transform.diagnostics().clone(),
@@ -765,7 +791,7 @@ impl Transform {
     ) -> Result<Coord3D> {
         validate_vertical_ordinate(c.z)?;
         if self.pipeline_owns_height(pipeline) {
-            return execute_pipeline_xyz(pipeline, c);
+            return self.execute_pipeline_owned(pipeline, c);
         }
         let xy = execute_pipeline_xy(pipeline, c)?;
         let z = self.vertical_transform.apply_z(c)?;

@@ -1,6 +1,6 @@
 use super::Transform;
 use crate::coord::Coord3D;
-use crate::crs::{CrsDef, LinearUnit, VerticalCrsDef};
+use crate::crs::{CrsDef, LinearUnit, VerticalCrsDef, VerticalCrsKind};
 use crate::error::{Error, Result};
 use crate::grid::{GridHandle, GridRuntime};
 use crate::operation::{
@@ -305,6 +305,34 @@ pub(super) fn compile_vertical_transform(
             vertical_label(source_vertical),
             vertical_label(target_vertical)
         ))),
+        (Some(source_vertical), None)
+            if target.is_geocentric() && source_vertical.kind().is_ellipsoidal_height() =>
+        {
+            // Height is consumed by geodetic to ECEF framing; convert it to
+            // metres at this boundary.
+            require_matching_ellipsoidal_height_datum(source, source_vertical)?;
+            Ok(VerticalTransform::None {
+                diagnostics: vertical_diagnostics(
+                    VerticalTransformAction::None,
+                    Some("Ellipsoidal height embedded in geocentric conversion".into()),
+                    Some(source_vertical),
+                    None,
+                ),
+            })
+        }
+        (None, Some(target_vertical))
+            if source.is_geocentric() && target_vertical.kind().is_ellipsoidal_height() =>
+        {
+            require_matching_ellipsoidal_height_datum(target, target_vertical)?;
+            Ok(VerticalTransform::None {
+                diagnostics: vertical_diagnostics(
+                    VerticalTransformAction::None,
+                    Some("Ellipsoidal height recovered from geocentric conversion".into()),
+                    None,
+                    Some(target_vertical),
+                ),
+            })
+        }
         (Some(_), None) | (None, Some(_)) => Err(Error::OperationSelection(
             "cannot transform between an explicit vertical CRS and a horizontal-only CRS; use Transform::new_horizontal or Transform::from_horizontal_components for an explicitly XY-only transform".into(),
         )),
@@ -590,6 +618,23 @@ fn nonzero_vertical_epsg(vertical: &VerticalCrsDef) -> Option<u32> {
 
 fn unit_factors_match(a: f64, b: f64) -> bool {
     (a - b).abs() <= 1e-12 * a.abs().max(b.abs()).max(1.0)
+}
+
+fn require_matching_ellipsoidal_height_datum(
+    horizontal_crs: &CrsDef,
+    vertical: &VerticalCrsDef,
+) -> Result<()> {
+    match vertical.kind() {
+        VerticalCrsKind::EllipsoidalHeight { datum }
+            if horizontal_crs.datum().same_datum(datum) =>
+        {
+            Ok(())
+        }
+        VerticalCrsKind::EllipsoidalHeight { .. } => Err(Error::OperationSelection(
+            "ellipsoidal height datum must match the horizontal CRS datum".into(),
+        )),
+        VerticalCrsKind::GravityRelatedHeight { .. } => Ok(()),
+    }
 }
 
 fn is_ellipsoidal_gravity_pair(source: &VerticalCrsDef, target: &VerticalCrsDef) -> bool {

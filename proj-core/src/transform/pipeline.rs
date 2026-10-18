@@ -7,7 +7,7 @@ use crate::grid::{GridError, GridHandle, GridRuntime};
 use crate::helmert;
 use crate::operation::{
     CoordinateOperation, CoordinateOperationMetadata, GeocentricAffineParams, GridShiftDirection,
-    OperationMethod, OperationStepDirection, VerticalTransformDiagnostics,
+    OperationDomain, OperationMethod, OperationStepDirection, VerticalTransformDiagnostics,
 };
 use crate::projection::{make_projection, validate_lon_lat, validate_projected, Projection};
 use crate::registry;
@@ -25,8 +25,7 @@ pub(super) struct CompiledOperationPipeline {
     steps: SmallVec<[CompiledStep; 8]>,
     pub(super) source_xy_units: PipelineSourceXyUnits,
     pub(super) target_xy_units: PipelineTargetXyUnits,
-    /// True when the steps change ellipsoidal height (Helmert/geocentric
-    /// datum math); horizontal grid shifts and projections do not.
+    /// True when the steps change ellipsoidal height.
     pub(super) transforms_ellipsoidal_height: bool,
 }
 
@@ -41,6 +40,7 @@ pub(super) struct CompiledOperationFallback {
 #[derive(Clone, Copy)]
 pub(super) enum PipelineSourceXyUnits {
     GeographicDegrees,
+    GeocentricMeters,
     ProjectedMeters,
     ProjectedNativeToMeters(LinearUnit),
 }
@@ -48,12 +48,16 @@ pub(super) enum PipelineSourceXyUnits {
 #[derive(Clone, Copy)]
 pub(super) enum PipelineTargetXyUnits {
     GeographicDegrees,
+    GeocentricMeters,
     ProjectedMeters,
     ProjectedMetersToNative(LinearUnit),
 }
 
 impl PipelineSourceXyUnits {
     fn compile(source: &CrsDef) -> Self {
+        if source.is_geocentric() {
+            return Self::GeocentricMeters;
+        }
         match source.as_projected() {
             Some(projected) if projected.linear_unit_to_meter() == 1.0 => Self::ProjectedMeters,
             Some(projected) => Self::ProjectedNativeToMeters(projected.linear_unit()),
@@ -68,6 +72,10 @@ impl PipelineSourceXyUnits {
                 let lat = coord.y.to_radians();
                 validate_lon_lat(lon, lat)?;
                 Ok(Coord3D::new(lon, lat, coord.z))
+            }
+            Self::GeocentricMeters => {
+                validate_pipeline_coord3d("geocentric input coordinate", coord)?;
+                Ok(coord)
             }
             Self::ProjectedMeters => {
                 validate_projected(coord.x, coord.y)?;
@@ -86,6 +94,9 @@ impl PipelineSourceXyUnits {
 
 impl PipelineTargetXyUnits {
     fn compile(target: &CrsDef) -> Self {
+        if target.is_geocentric() {
+            return Self::GeocentricMeters;
+        }
         match target.as_projected() {
             Some(projected) if projected.linear_unit_to_meter() == 1.0 => Self::ProjectedMeters,
             Some(projected) => Self::ProjectedMetersToNative(projected.linear_unit()),
@@ -96,7 +107,7 @@ impl PipelineTargetXyUnits {
     fn denormalize(self, coord: Coord3D) -> Coord {
         match self {
             Self::GeographicDegrees => Coord::new(coord.x.to_degrees(), coord.y.to_degrees()),
-            Self::ProjectedMeters => Coord::new(coord.x, coord.y),
+            Self::GeocentricMeters | Self::ProjectedMeters => Coord::new(coord.x, coord.y),
             Self::ProjectedMetersToNative(unit) => {
                 Coord::new(unit.from_meters(coord.x), unit.from_meters(coord.y))
             }
@@ -140,6 +151,10 @@ enum CompiledStep {
     GeocentricToGeodetic {
         ellipsoid: Ellipsoid,
     },
+    /// Save ellipsoidal height (C PROJ `+proj=push +v_3`).
+    PushHeight,
+    /// Restore the height saved by [`CompiledStep::PushHeight`].
+    PopHeight,
 }
 
 pub(super) fn validate_output_len(input_len: usize, output_len: usize) -> Result<()> {
@@ -221,48 +236,92 @@ fn execute_step(step: &CompiledStep, coord: Coord3D) -> Result<Coord3D> {
                 geocentric::geocentric_to_geodetic(ellipsoid, coord.x, coord.y, coord.z)?;
             Coord3D::new(lon, lat, h)
         }
+        CompiledStep::PushHeight | CompiledStep::PopHeight => {
+            return Err(Error::InvalidDefinition(
+                "height passthrough steps must be executed with a stack".into(),
+            ));
+        }
     };
 
     validate_pipeline_coord3d("pipeline step output", result)?;
     Ok(result)
 }
 
+fn execute_steps(steps: &[CompiledStep], mut coord: Coord3D) -> Result<Coord3D> {
+    let mut height_stack = SmallVec::<[f64; 2]>::new();
+    for step in steps {
+        coord = match step {
+            CompiledStep::PushHeight => {
+                height_stack.push(coord.z);
+                coord
+            }
+            CompiledStep::PopHeight => match height_stack.pop() {
+                Some(z) => Coord3D::new(coord.x, coord.y, z),
+                None => {
+                    return Err(Error::InvalidDefinition(
+                        "2D height passthrough popped with an empty stack".into(),
+                    ));
+                }
+            },
+            other => execute_step(other, coord)?,
+        };
+    }
+    if !height_stack.is_empty() {
+        return Err(Error::InvalidDefinition(
+            "2D height passthrough left values on the stack".into(),
+        ));
+    }
+    Ok(coord)
+}
+
 pub(super) fn execute_pipeline_xy(
     pipeline: &CompiledOperationPipeline,
     c: Coord3D,
 ) -> Result<Coord> {
-    let mut state = pipeline.source_xy_units.normalize(c)?;
+    require_xy_pipeline_supported(pipeline)?;
+
+    let state = pipeline.source_xy_units.normalize(c)?;
     if pipeline.steps.is_empty() {
         let output = Coord::new(c.x, c.y);
         validate_pipeline_coord("pipeline final output", output)?;
         return Ok(output);
     }
 
-    for step in &pipeline.steps {
-        state = execute_step(step, state)?;
-    }
+    let state = execute_steps(&pipeline.steps, state)?;
 
     let output = pipeline.target_xy_units.denormalize(state);
     validate_pipeline_coord("pipeline final output", output)?;
     Ok(output)
 }
 
-/// Like [`execute_pipeline_xy`] but keeps the pipeline's `z` output, so
-/// datum-shift-induced ellipsoidal height changes survive. `z` is in meters
-/// throughout; the x/y unit adapters do not touch it.
+fn require_xy_pipeline_supported(pipeline: &CompiledOperationPipeline) -> Result<()> {
+    if matches!(
+        pipeline.source_xy_units,
+        PipelineSourceXyUnits::GeocentricMeters
+    ) || matches!(
+        pipeline.target_xy_units,
+        PipelineTargetXyUnits::GeocentricMeters
+    ) {
+        return Err(Error::InvalidDefinition(
+            "geocentric (ECEF) transforms require convert_3d; the 2D convert API cannot represent Z"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Like [`execute_pipeline_xy`] but keeps the pipeline's `z` (metres).
 pub(super) fn execute_pipeline_xyz(
     pipeline: &CompiledOperationPipeline,
     c: Coord3D,
 ) -> Result<Coord3D> {
-    let mut state = pipeline.source_xy_units.normalize(c)?;
+    let state = pipeline.source_xy_units.normalize(c)?;
     if pipeline.steps.is_empty() {
         validate_pipeline_coord3d("pipeline final output", c)?;
         return Ok(c);
     }
 
-    for step in &pipeline.steps {
-        state = execute_step(step, state)?;
-    }
+    let state = execute_steps(&pipeline.steps, state)?;
 
     let xy = pipeline.target_xy_units.denormalize(state);
     let output = Coord3D::new(xy.x, xy.y, state.z);
@@ -308,6 +367,11 @@ pub(super) fn compile_pipeline(
         steps.push(CompiledStep::ProjectionInverse {
             projection: make_projection(&projected.method(), projected.datum())?,
         });
+    } else if let Some(geocentric) = source.as_geocentric() {
+        // Frame geocentric endpoints into geodetic radians, like projections.
+        steps.push(CompiledStep::GeocentricToGeodetic {
+            ellipsoid: geocentric.datum().ellipsoid(),
+        });
     }
 
     match operation {
@@ -332,21 +396,23 @@ pub(super) fn compile_pipeline(
         }
     }
 
-    if let Some(projected) = target.as_projected() {
+    if let Some(geocentric) = target.as_geocentric() {
+        steps.push(CompiledStep::GeodeticToGeocentric {
+            ellipsoid: geocentric.datum().ellipsoid(),
+        });
+    } else if let Some(projected) = target.as_projected() {
         steps.push(CompiledStep::ProjectionForward {
             projection: make_projection(&projected.method(), projected.datum())?,
         });
     }
 
-    let transforms_ellipsoidal_height = steps.iter().any(|step| {
-        matches!(
-            step,
-            CompiledStep::Helmert { .. }
-                | CompiledStep::GeocentricAffine { .. }
-                | CompiledStep::GeodeticToGeocentric { .. }
-                | CompiledStep::GeocentricToGeodetic { .. }
-        )
-    });
+    cancel_redundant_geocentric_framing(&mut steps);
+
+    // Geocentric endpoints always transform height via cart framing.
+    // Push/pop pairs restore height, so they do not count.
+    let transforms_ellipsoidal_height = source.is_geocentric()
+        || target.is_geocentric()
+        || steps_transform_ellipsoidal_height(&steps);
 
     Ok(CompiledOperationPipeline {
         steps,
@@ -354,6 +420,70 @@ pub(super) fn compile_pipeline(
         target_xy_units: PipelineTargetXyUnits::compile(target),
         transforms_ellipsoidal_height,
     })
+}
+
+fn steps_transform_ellipsoidal_height(steps: &[CompiledStep]) -> bool {
+    let mut passthrough_depth = 0usize;
+    for step in steps {
+        match step {
+            CompiledStep::PushHeight => passthrough_depth += 1,
+            CompiledStep::PopHeight => {
+                passthrough_depth = passthrough_depth.saturating_sub(1);
+            }
+            CompiledStep::Helmert { .. }
+            | CompiledStep::GeocentricAffine { .. }
+            | CompiledStep::GeodeticToGeocentric { .. }
+            | CompiledStep::GeocentricToGeodetic { .. }
+                if passthrough_depth == 0 =>
+            {
+                return true;
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+fn ellipsoids_match(a: Ellipsoid, b: Ellipsoid) -> bool {
+    (a.semi_major_axis() - b.semi_major_axis()).abs() < 1e-6
+        && (a.flattening() - b.flattening()).abs() < 1e-12
+}
+
+fn geocentric_framing_cancels(left: &CompiledStep, right: &CompiledStep) -> bool {
+    match (left, right) {
+        (
+            CompiledStep::GeodeticToGeocentric { ellipsoid: a },
+            CompiledStep::GeocentricToGeodetic { ellipsoid: b },
+        )
+        | (
+            CompiledStep::GeocentricToGeodetic { ellipsoid: a },
+            CompiledStep::GeodeticToGeocentric { ellipsoid: b },
+        ) => ellipsoids_match(*a, *b),
+        _ => false,
+    }
+}
+
+/// Drop adjacent geodetic to ECEF pairs on the same ellipsoid.
+///
+/// Helmert sandwiches already enter and leave geodetic space, so extra
+/// geocentric framing next to them is redundant.
+fn cancel_redundant_geocentric_framing(steps: &mut SmallVec<[CompiledStep; 8]>) {
+    loop {
+        let mut removed = false;
+        let mut i = 0;
+        while i + 1 < steps.len() {
+            if geocentric_framing_cancels(&steps[i], &steps[i + 1]) {
+                steps.remove(i + 1);
+                steps.remove(i);
+                removed = true;
+            } else {
+                i += 1;
+            }
+        }
+        if !removed {
+            break;
+        }
+    }
 }
 
 fn compile_operation(
@@ -365,46 +495,47 @@ fn compile_operation(
 ) -> Result<()> {
     let (source_geo, target_geo) =
         resolve_operation_geographic_pair(operation, direction, requested_pair)?;
+    let preserve_height = preserve_ellipsoidal_height(operation.domain, requested_pair);
     match (&operation.method, direction) {
         (OperationMethod::Identity, _) => {}
         (OperationMethod::Helmert { params }, OperationStepDirection::Forward) => {
             params.validate()?;
-            steps.push(CompiledStep::GeodeticToGeocentric {
-                ellipsoid: source_geo.datum().ellipsoid(),
-            });
-            steps.push(CompiledStep::Helmert {
-                params: *params,
-                inverse: false,
-            });
-            steps.push(CompiledStep::GeocentricToGeodetic {
-                ellipsoid: target_geo.datum().ellipsoid(),
-            });
+            compile_geocentric_sandwich(
+                source_geo.datum().ellipsoid(),
+                target_geo.datum().ellipsoid(),
+                preserve_height,
+                CompiledStep::Helmert {
+                    params: *params,
+                    inverse: false,
+                },
+                steps,
+            );
         }
         (OperationMethod::Helmert { params }, OperationStepDirection::Reverse) => {
             params.validate()?;
-            steps.push(CompiledStep::GeodeticToGeocentric {
-                ellipsoid: source_geo.datum().ellipsoid(),
-            });
-            steps.push(CompiledStep::Helmert {
-                params: *params,
-                inverse: true,
-            });
-            steps.push(CompiledStep::GeocentricToGeodetic {
-                ellipsoid: target_geo.datum().ellipsoid(),
-            });
+            compile_geocentric_sandwich(
+                source_geo.datum().ellipsoid(),
+                target_geo.datum().ellipsoid(),
+                preserve_height,
+                CompiledStep::Helmert {
+                    params: *params,
+                    inverse: true,
+                },
+                steps,
+            );
         }
         (OperationMethod::GeocentricAffine { params }, direction) => {
             params.validate()?;
-            steps.push(CompiledStep::GeodeticToGeocentric {
-                ellipsoid: source_geo.datum().ellipsoid(),
-            });
-            steps.push(CompiledStep::GeocentricAffine {
-                params: *params,
-                inverse: matches!(direction, OperationStepDirection::Reverse),
-            });
-            steps.push(CompiledStep::GeocentricToGeodetic {
-                ellipsoid: target_geo.datum().ellipsoid(),
-            });
+            compile_geocentric_sandwich(
+                source_geo.datum().ellipsoid(),
+                target_geo.datum().ellipsoid(),
+                preserve_height,
+                CompiledStep::GeocentricAffine {
+                    params: *params,
+                    inverse: matches!(direction, OperationStepDirection::Reverse),
+                },
+                steps,
+            );
         }
         (
             OperationMethod::DatumShift {
@@ -416,12 +547,14 @@ fn compile_operation(
             compile_to_wgs84(
                 source_to_wgs84,
                 source_geo.datum().ellipsoid(),
+                preserve_height,
                 grid_runtime,
                 steps,
             )?;
             compile_from_wgs84(
                 target_to_wgs84,
                 target_geo.datum().ellipsoid(),
+                preserve_height,
                 grid_runtime,
                 steps,
             )?;
@@ -436,12 +569,14 @@ fn compile_operation(
             compile_to_wgs84(
                 target_to_wgs84,
                 source_geo.datum().ellipsoid(),
+                preserve_height,
                 grid_runtime,
                 steps,
             )?;
             compile_from_wgs84(
                 source_to_wgs84,
                 target_geo.datum().ellipsoid(),
+                preserve_height,
                 grid_runtime,
                 steps,
             )?;
@@ -477,7 +612,7 @@ fn compile_operation(
                 let child = registry::lookup_operation(step.operation_id).ok_or_else(|| {
                     Error::UnknownOperation(format!("unknown operation id {}", step.operation_id.0))
                 })?;
-                compile_operation(&child, step.direction, None, grid_runtime, steps)?;
+                compile_operation(&child, step.direction, requested_pair, grid_runtime, steps)?;
             }
         }
         (OperationMethod::Concatenated { steps: child_steps }, OperationStepDirection::Reverse) => {
@@ -485,7 +620,13 @@ fn compile_operation(
                 let child = registry::lookup_operation(step.operation_id).ok_or_else(|| {
                     Error::UnknownOperation(format!("unknown operation id {}", step.operation_id.0))
                 })?;
-                compile_operation(&child, step.direction.inverse(), None, grid_runtime, steps)?;
+                compile_operation(
+                    &child,
+                    step.direction.inverse(),
+                    requested_pair,
+                    grid_runtime,
+                    steps,
+                )?;
             }
         }
         (OperationMethod::Projection { .. }, _) | (OperationMethod::AxisUnitNormalize, _) => {
@@ -497,9 +638,43 @@ fn compile_operation(
     Ok(())
 }
 
+/// Preserve height when the operation is horizontal-only and at least one
+/// requested endpoint is 2D.
+fn preserve_ellipsoidal_height(
+    domain: OperationDomain,
+    requested_pair: Option<(&CrsDef, &CrsDef)>,
+) -> bool {
+    domain == OperationDomain::HorizontalOnly
+        && requested_pair
+            .is_some_and(|(source, target)| source.is_horizontal_2d() || target.is_horizontal_2d())
+}
+
+fn compile_geocentric_sandwich(
+    source_ellipsoid: Ellipsoid,
+    target_ellipsoid: Ellipsoid,
+    preserve_height: bool,
+    step: CompiledStep,
+    steps: &mut SmallVec<[CompiledStep; 8]>,
+) {
+    if preserve_height {
+        steps.push(CompiledStep::PushHeight);
+    }
+    steps.push(CompiledStep::GeodeticToGeocentric {
+        ellipsoid: source_ellipsoid,
+    });
+    steps.push(step);
+    steps.push(CompiledStep::GeocentricToGeodetic {
+        ellipsoid: target_ellipsoid,
+    });
+    if preserve_height {
+        steps.push(CompiledStep::PopHeight);
+    }
+}
+
 fn compile_to_wgs84(
     transform: &DatumToWgs84,
     source_ellipsoid: Ellipsoid,
+    preserve_height: bool,
     grid_runtime: &GridRuntime,
     steps: &mut SmallVec<[CompiledStep; 8]>,
 ) -> Result<()> {
@@ -507,16 +682,16 @@ fn compile_to_wgs84(
         DatumToWgs84::Identity => Ok(()),
         DatumToWgs84::Helmert(params) => {
             params.validate()?;
-            steps.push(CompiledStep::GeodeticToGeocentric {
-                ellipsoid: source_ellipsoid,
-            });
-            steps.push(CompiledStep::Helmert {
-                params: *params,
-                inverse: false,
-            });
-            steps.push(CompiledStep::GeocentricToGeodetic {
-                ellipsoid: ellipsoid::WGS84,
-            });
+            compile_geocentric_sandwich(
+                source_ellipsoid,
+                ellipsoid::WGS84,
+                preserve_height,
+                CompiledStep::Helmert {
+                    params: *params,
+                    inverse: false,
+                },
+                steps,
+            );
             Ok(())
         }
         DatumToWgs84::GridShift(grids) => {
@@ -531,6 +706,7 @@ fn compile_to_wgs84(
 fn compile_from_wgs84(
     transform: &DatumToWgs84,
     target_ellipsoid: Ellipsoid,
+    preserve_height: bool,
     grid_runtime: &GridRuntime,
     steps: &mut SmallVec<[CompiledStep; 8]>,
 ) -> Result<()> {
@@ -538,16 +714,16 @@ fn compile_from_wgs84(
         DatumToWgs84::Identity => Ok(()),
         DatumToWgs84::Helmert(params) => {
             params.validate()?;
-            steps.push(CompiledStep::GeodeticToGeocentric {
-                ellipsoid: ellipsoid::WGS84,
-            });
-            steps.push(CompiledStep::Helmert {
-                params: *params,
-                inverse: true,
-            });
-            steps.push(CompiledStep::GeocentricToGeodetic {
-                ellipsoid: target_ellipsoid,
-            });
+            compile_geocentric_sandwich(
+                ellipsoid::WGS84,
+                target_ellipsoid,
+                preserve_height,
+                CompiledStep::Helmert {
+                    params: *params,
+                    inverse: true,
+                },
+                steps,
+            );
             Ok(())
         }
         DatumToWgs84::GridShift(grids) => {
@@ -653,4 +829,94 @@ pub(super) fn should_parallelize(len: usize) -> bool {
 
     let threads = rayon::current_num_threads().max(1);
     len >= PARALLEL_MIN_TOTAL_ITEMS.max(threads.saturating_mul(PARALLEL_MIN_ITEMS_PER_THREAD))
+}
+
+#[cfg(test)]
+mod framing_tests {
+    use super::*;
+    use crate::ellipsoid;
+
+    #[test]
+    fn cancel_adjacent_same_ellipsoid_cart_pair() {
+        let mut steps = SmallVec::<[CompiledStep; 8]>::new();
+        steps.push(CompiledStep::GeocentricToGeodetic {
+            ellipsoid: ellipsoid::WGS84,
+        });
+        steps.push(CompiledStep::GeodeticToGeocentric {
+            ellipsoid: ellipsoid::WGS84,
+        });
+        cancel_redundant_geocentric_framing(&mut steps);
+        assert!(steps.is_empty());
+    }
+
+    #[test]
+    fn keep_cart_pair_on_different_ellipsoids() {
+        let mut steps = SmallVec::<[CompiledStep; 8]>::new();
+        steps.push(CompiledStep::GeodeticToGeocentric {
+            ellipsoid: ellipsoid::CLARKE1866,
+        });
+        steps.push(CompiledStep::GeocentricToGeodetic {
+            ellipsoid: ellipsoid::WGS84,
+        });
+        cancel_redundant_geocentric_framing(&mut steps);
+        assert_eq!(steps.len(), 2);
+    }
+
+    #[test]
+    fn push_pop_restores_height_and_does_not_count_as_transforming_it() {
+        let mut steps = SmallVec::<[CompiledStep; 8]>::new();
+        steps.push(CompiledStep::PushHeight);
+        steps.push(CompiledStep::GeodeticToGeocentric {
+            ellipsoid: ellipsoid::WGS84,
+        });
+        steps.push(CompiledStep::GeocentricToGeodetic {
+            ellipsoid: ellipsoid::WGS84,
+        });
+        steps.push(CompiledStep::PopHeight);
+        assert!(!steps_transform_ellipsoidal_height(&steps));
+
+        let input = Coord3D::new(0.1, 0.9, 43.0);
+        let output = execute_steps(&steps, input).unwrap();
+        assert!((output.z - 43.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn push_pop_only_when_a_requested_endpoint_is_2d() {
+        let geographic = CrsDef::Geographic(crate::crs::GeographicCrsDef::new(
+            4326,
+            crate::datum::WGS84,
+            "WGS 84",
+        ));
+        let geocentric = CrsDef::Geocentric(crate::crs::GeocentricCrsDef::new(
+            4978,
+            4326,
+            crate::datum::WGS84,
+            "WGS 84",
+        ));
+        assert!(preserve_ellipsoidal_height(
+            OperationDomain::HorizontalOnly,
+            Some((&geographic, &geocentric)),
+        ));
+        assert!(!preserve_ellipsoidal_height(
+            OperationDomain::HorizontalOnly,
+            Some((&geocentric, &geocentric)),
+        ));
+        assert!(!preserve_ellipsoidal_height(
+            OperationDomain::IncludesHeight,
+            Some((&geographic, &geographic)),
+        ));
+        assert!(!preserve_ellipsoidal_height(
+            OperationDomain::HorizontalOnly,
+            None,
+        ));
+    }
+
+    #[test]
+    fn unwrapped_cart_counts_as_transforming_height() {
+        let mut steps = SmallVec::<[CompiledStep; 8]>::new();
+        steps.push(CompiledStep::GeodeticToGeocentric {
+            ellipsoid: ellipsoid::WGS84,
+        });
+        assert!(steps_transform_ellipsoidal_height(&steps));
+    }
 }

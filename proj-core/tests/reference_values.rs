@@ -13,10 +13,10 @@
 //! - Roundtrip verification (forward then inverse)
 //! - Edge cases (poles, antimeridian, equator, projection zone boundaries,
 //!   near-pole inverses, wrong-hemisphere polar stereographic inputs)
-//! - 3D points through promoted 3D CRSs, including cross-datum ellipsoidal
-//!   height changes
+//! - 3D points through default CRS-to-CRS (geographic-2D operations preserve
+//!   height; same-datum and ECEF paths still use ellipsoidal height)
 
-use proj_core::{AreaOfInterest, Coord, SelectionOptions, Transform};
+use proj_core::{lookup_epsg, AreaOfInterest, Coord, SelectionOptions, Transform};
 use serde::Deserialize;
 
 #[derive(Deserialize)]
@@ -53,10 +53,17 @@ fn load_corpus() -> Vec<ReferencePoint> {
 /// the reference values come from C PROJ's per-point late-binding operation
 /// selection, so location-aware selection is the comparable configuration.
 fn check_point(r: &ReferencePoint) -> Result<(), String> {
-    let point = Coord::new(r.input_x, r.input_y);
-    let options = SelectionOptions {
-        area_of_interest: Some(AreaOfInterest::source_crs_point(point)),
-        ..SelectionOptions::default()
+    // Geocentric sources have no horizontal component for AOI sampling; omit
+    // the point AOI there. Geographic/projected sources keep per-point AOI so
+    // late-binding selection matches the C PROJ corpus generator.
+    let options = match lookup_epsg(r.from_epsg) {
+        Some(crs) if crs.is_geocentric() => SelectionOptions::default(),
+        _ => SelectionOptions {
+            area_of_interest: Some(AreaOfInterest::source_crs_point(Coord::new(
+                r.input_x, r.input_y,
+            ))),
+            ..SelectionOptions::default()
+        },
     };
     let t = Transform::with_selection_options(
         &format!("EPSG:{}", r.from_epsg),
@@ -227,10 +234,22 @@ fn corpus_has_adequate_coverage() {
     assert!(from_epsgs.contains(&3857), "missing 3857→4326 inverse");
     assert!(from_epsgs.contains(&3413), "missing 3413→4326 inverse");
 
-    // Verify 3D coverage (promoted 3D CRS references)
+    // Verify 3D coverage (default CRS-to-CRS, including ECEF)
     assert!(
         corpus.iter().any(|r| r.input_z.is_some()),
         "missing 3D reference points"
+    );
+    assert!(
+        corpus
+            .iter()
+            .any(|r| r.from_epsg == 4978 || r.to_epsg == 4978),
+        "missing geocentric ECEF (EPSG:4978) reference points"
+    );
+    assert!(
+        corpus
+            .iter()
+            .any(|r| r.from_epsg == 28992 && r.to_epsg == 4978 && r.input_z.is_some()),
+        "missing RD New → ECEF height-passthrough reference point"
     );
     // Verify near-pole and wrong-hemisphere edge coverage
     assert!(
