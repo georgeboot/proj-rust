@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- reject ZSTD-compressed GeoTIFF grids, including LERC+ZSTD, before decoding until the upstream TIFF reader upgrades past RUSTSEC-2026-0344
 - breaking: preserve ellipsoidal height across horizontal-only datum operations when at least one requested endpoint is 2D (`+proj=push +v_3` / `+proj=pop +v_3`); both-3D or both-geocentric pairs apply the full 3D Helmert
 - breaking: add `CoordinateOperation.domain` (`HorizontalOnly` or `IncludesHeight`), inferred from the source/target CRS tables
 - breaking: add `CrsDef::Geocentric` and `GeocentricCrsDef` and bump the embedded registry format to v11 with a geocentric CRS section; exhaustive matches on `CrsDef` must handle the new variant
