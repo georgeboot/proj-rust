@@ -920,7 +920,9 @@ mod geotiff {
             .ifd(base_index)
             .map_err(|err| GridError::Parse(format!("{name}: {err}")))?;
         let kind = grid_kind(
-            base_ifd.tag(TIFFTAG_GDAL_METADATA).map(|tag| &tag.value),
+            base_ifd
+                .tag(TIFFTAG_GDAL_METADATA)
+                .and_then(|tag| TagValue::as_str(&tag.value)),
             name,
         )?;
 
@@ -957,11 +959,8 @@ mod geotiff {
         }
     }
 
-    fn grid_kind(metadata: Option<&TagValue>, name: &str) -> Result<Kind, GridError> {
-        let text = match metadata {
-            Some(TagValue::Ascii(text)) => text.to_ascii_uppercase(),
-            _ => String::new(),
-        };
+    fn grid_kind(metadata: Option<&str>, name: &str) -> Result<Kind, GridError> {
+        let text = metadata.map(str::to_ascii_uppercase).unwrap_or_default();
         if text.contains("VERTICAL") {
             Ok(Kind::Vertical)
         } else if text.contains("HORIZONTAL") {
@@ -1009,9 +1008,13 @@ mod geotiff {
             )));
         }
 
-        let scale = doubles(ifd.tag(TIFFTAG_MODEL_PIXEL_SCALE).map(|tag| &tag.value))
+        let scale = ifd
+            .tag(TIFFTAG_MODEL_PIXEL_SCALE)
+            .and_then(|tag| TagValue::as_f64_vec(&tag.value))
             .ok_or_else(|| GridError::Parse(format!("{name}: missing ModelPixelScale")))?;
-        let tiepoint = doubles(ifd.tag(TIFFTAG_MODEL_TIEPOINT).map(|tag| &tag.value))
+        let tiepoint = ifd
+            .tag(TIFFTAG_MODEL_TIEPOINT)
+            .and_then(|tag| TagValue::as_f64_vec(&tag.value))
             .ok_or_else(|| GridError::Parse(format!("{name}: missing ModelTiepoint")))?;
         if scale.len() < 2 || tiepoint.len() < 6 {
             return Err(GridError::Parse(format!(
@@ -1226,14 +1229,6 @@ mod geotiff {
             && outer.extent.north >= inner.extent.north - tol
             // A strictly larger cell is a coarser (parent) grid.
             && outer.extent.res_x > inner.extent.res_x * (1.0 + 1e-9)
-    }
-
-    fn doubles(value: Option<&TagValue>) -> Option<Vec<f64>> {
-        match value? {
-            TagValue::Double(values) => Some(values.clone()),
-            TagValue::Float(values) => Some(values.iter().map(|&v| v as f64).collect()),
-            _ => None,
-        }
     }
 }
 
