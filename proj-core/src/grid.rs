@@ -863,7 +863,7 @@ mod geotiff {
     };
     use geotiff_reader::{GeoTiffFile, GeoTiffOpenOptions};
     use std::f64::consts::PI;
-    use tiff_core::TagValue;
+    use tiff_core::{Compression, LercAdditionalCompression, TagValue};
 
     const TIFFTAG_MODEL_PIXEL_SCALE: u16 = 33550;
     const TIFFTAG_MODEL_TIEPOINT: u16 = 33922;
@@ -913,6 +913,26 @@ mod geotiff {
             return Err(GridError::Parse(format!(
                 "{name}: GeoTIFF IFD count {ifd_count} exceeds limit {MAX_GEOTIFF_IFDS}"
             )));
+        }
+
+        // tiff-reader 0.8.1 uses vulnerable ruzstd 0.8.1. Reject both TIFF
+        // ZSTD and LERC+ZSTD before any image is decoded (RUSTSEC-2026-0344).
+        for index in 0..ifd_count {
+            let ifd = tiff
+                .ifd(index)
+                .map_err(|err| GridError::Parse(format!("{name}: {err}")))?;
+            let uses_zstd = Compression::from_code(ifd.compression()) == Some(Compression::Zstd)
+                || ifd
+                    .lerc_parameters()
+                    .map_err(|err| GridError::Parse(format!("{name}: {err}")))?
+                    .is_some_and(|params| {
+                        params.additional_compression == LercAdditionalCompression::Zstd
+                    });
+            if uses_zstd {
+                return Err(GridError::Parse(format!(
+                    "{name}: GeoTIFF image {index} uses unsupported ZSTD compression"
+                )));
+            }
         }
 
         let base_index = file.base_ifd_index();
@@ -2587,6 +2607,43 @@ mod tests {
 
         assert!(message.contains("IFD"), "{message}");
         assert!(message.contains(&MAX_GEOTIFF_IFDS.to_string()), "{message}");
+    }
+
+    #[cfg(feature = "geotiff")]
+    #[test]
+    fn geotiff_rejects_zstd_in_any_ifd_before_decoding() {
+        let ordinary = minimal_geotiff_tags(2, 2, 1, "TYPE=VERTICAL_OFFSET");
+        let mut zstd = ordinary.clone();
+        zstd.retain(|tag| tag.tag != 259);
+        zstd.push(test_tiff_short(259, 50000));
+
+        for images in [vec![zstd.clone()], vec![ordinary.clone(), zstd]] {
+            let message = geotiff_parse_error(&classic_tiff(images));
+            assert!(
+                message.contains("unsupported ZSTD compression"),
+                "{message}"
+            );
+        }
+    }
+
+    #[cfg(feature = "geotiff")]
+    #[test]
+    fn geotiff_rejects_lerc_zstd_before_decoding() {
+        let mut image = minimal_geotiff_tags(2, 2, 1, "TYPE=VERTICAL_OFFSET");
+        image.retain(|tag| tag.tag != 259);
+        image.push(test_tiff_short(259, 34887));
+        image.push(TestTiffTag {
+            tag: 50674,
+            field_type: 4,
+            count: 2,
+            value: [4u32.to_le_bytes(), 2u32.to_le_bytes()].concat(),
+        });
+
+        let message = geotiff_parse_error(&classic_tiff(vec![image]));
+        assert!(
+            message.contains("unsupported ZSTD compression"),
+            "{message}"
+        );
     }
 
     #[cfg(feature = "geotiff")]

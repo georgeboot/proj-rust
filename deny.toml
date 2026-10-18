@@ -7,6 +7,10 @@ all-features = true
 [advisories]
 version = 2
 yanked = "deny"
+# RUSTSEC-2026-0344: geotiff-reader 0.8.1 pins tiff-reader 0.8.1 to vulnerable
+# ruzstd 0.8.1. The GeoTIFF grid loader rejects TIFF ZSTD and LERC+ZSTD in
+# every IFD before decoding. Remove this exception after upstream upgrades.
+ignore = ["RUSTSEC-2026-0344"]
 
 [licenses]
 version = 2
