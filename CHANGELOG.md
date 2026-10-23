@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- fix RDNAPTRANS2018 (`EPSG:4979` → `EPSG:7415`) failing construction since 0.10 with "geoid-grid vertical transforms cannot yet be composed with a horizontal datum shift": horizontal-only operations now also preserve ellipsoidal height when a requested endpoint is a gravity-related compound (like C PROJ's `push`/`pop` `v_3`), so they compose with geoid grids
+- compile zero-parameter Helmerts between the same ellipsoid or GRS80 and WGS 84 (for example EPSG:1149 ETRS89 to WGS 84) to a no-op like C PROJ, removing a ~0.1 mm geocentric round-trip difference
+
 ## 0.12.0 - 2026-10-18
 
 - reject ZSTD-compressed GeoTIFF grids, including LERC+ZSTD, before decoding until the upstream TIFF reader upgrades past RUSTSEC-2026-0344
