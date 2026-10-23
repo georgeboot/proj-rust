@@ -4,7 +4,8 @@
 //! Requires the `geotiff` feature. Grid files are not bundled; point
 //! `PROJ_RDNAP_GRID_DIR` at a directory containing `nl_nsgi_rdtrans2018.tif`
 //! and `nl_nsgi_nlgeo2018.tif` (e.g. downloaded from <https://cdn.proj.org/>).
-//! When the variable is unset or the grids are missing, the tests no-op.
+//! When the variable is unset the tests no-op; when it is set, missing grids
+//! fail the tests so CI cannot skip them silently.
 #![cfg(feature = "geotiff")]
 
 use std::path::PathBuf;
@@ -14,13 +15,17 @@ use proj_core::{FilesystemGridProvider, SelectionOptions, Transform};
 
 const GRIDS: [&str; 2] = ["nl_nsgi_rdtrans2018.tif", "nl_nsgi_nlgeo2018.tif"];
 
-/// Returns the grid directory if it exists and contains both grids, else `None`.
+/// Returns the grid directory when `PROJ_RDNAP_GRID_DIR` is set, else `None`.
 fn grid_dir() -> Option<PathBuf> {
     let dir = PathBuf::from(std::env::var_os("PROJ_RDNAP_GRID_DIR")?);
-    GRIDS
-        .iter()
-        .all(|name| dir.join(name).is_file())
-        .then_some(dir)
+    for name in GRIDS {
+        assert!(
+            dir.join(name).is_file(),
+            "PROJ_RDNAP_GRID_DIR is set but {name} is missing from {}",
+            dir.display()
+        );
+    }
+    Some(dir)
 }
 
 fn rd_transform(dir: PathBuf) -> Transform {
