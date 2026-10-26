@@ -42,23 +42,11 @@ jobs:
       - name: Clippy geotiff feature
         run: cargo clippy -p proj-core --features geotiff --all-targets --locked -- -D warnings
 
-      - name: Download RDNAPTRANS2018 grids
-        run: |
-          mkdir -p "$RUNNER_TEMP/proj-grids"
-          cd "$RUNNER_TEMP/proj-grids"
-          for grid in nl_nsgi_rdtrans2018.tif nl_nsgi_nlgeo2018.tif; do
-            curl --fail --silent --show-error --location --retry 3 \
-              --output "$grid" "https://cdn.proj.org/$grid"
-          done
-          sha256sum --check --strict <<'EOF'
-          7653831191b424e715a906468962fc60071cfb71a3186b2a58f098bab8bf41de  nl_nsgi_rdtrans2018.tif
-          f8e32c56bf8940fc3fefbc0e413eb4546633ed598b669c63856cddf8328992c0  nl_nsgi_nlgeo2018.tif
-          EOF
-
       - name: Test geotiff feature
         run: cargo test -p proj-core --features geotiff --locked
         env:
-          PROJ_RDNAP_GRID_DIR: ${{ runner.temp }}/proj-grids
+          # Lets the RDNAPTRANS2018 parity test fetch its grids from cdn.proj.org.
+          PROJ_NETWORK: "ON"
 
   gen-reference:
     name: Registry Generator
